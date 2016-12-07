@@ -38,10 +38,14 @@ enum WorkerThreads {
 
 struct tagAerosmith;
 
-struct tagMessage {
+struct sound_play_req_t {
     uint32_t play_id;
     char source[256];
     int be_overwrite;
+};
+
+struct sound_volume_req_t {
+    uint16_t volume;
 };
 
 struct tagPlayItem {
@@ -617,9 +621,10 @@ int main(int argc, char **argv)
     sleep(120);
 #else
     bool be_exit = false;
-    mqd_t fg_mq, bg_mq;
+    mqd_t fg_mq, bg_mq, vol_mq;
     struct mq_attr attr;
-    struct tagMessage *message;
+    struct sound_play_req_t *play_req;
+    struct sound_volume_req_t *vol_req;
     char *buf;
     ssize_t received;
     struct tagPlayItem item;
@@ -637,23 +642,31 @@ int main(int argc, char **argv)
         terminate(&self);
         return 4;
     }
+    vol_mq = mq_open("/aerosmith-vol", O_RDONLY | O_CREAT | O_CLOEXEC | O_NONBLOCK, 0666, NULL);
+    if (vol_mq == (mqd_t) -1) {
+        DEBUG("mq_open failed: %d", errno);
+        mq_close(bg_mq);
+        mq_close(fg_mq);
+        terminate(&self);
+        return 5;
+    }
     mq_getattr(fg_mq, &attr);
     buf = malloc(attr.mq_msgsize);
     while (!be_exit) {
         received = mq_receive(fg_mq, buf, attr.mq_msgsize, NULL);
-        if (received == sizeof(*message)) {
-            message = (struct tagMessage *) buf;
-            if (message->be_overwrite) {
+        if (received == sizeof(*play_req)) {
+            play_req = (struct sound_play_req_t *) buf;
+            if (play_req->be_overwrite) {
                 playlist_clear(&self.sinks[WORKER_FOREGROUND].playlist);
                 if (self.sinks[WORKER_FOREGROUND].playing) {
                     self.sinks[WORKER_FOREGROUND].playing->be_cancel = true;
                 }
             }
-            if (message->play_id == 0xFFFFFFFF) {
+            if (play_req->play_id == 0xFFFFFFFF) {
                 be_exit = true;
-            } else if (message->play_id > 0) {
-                item.play_id = message->play_id;
-                strncpy(item.source, message->source, sizeof(item.source));
+            } else if (play_req->play_id > 0) {
+                item.play_id = play_req->play_id;
+                strncpy(item.source, play_req->source, sizeof(item.source));
                 item.channels = 2;
                 item.be_cancel = false;
                 playlist_enq(&self.sinks[WORKER_FOREGROUND].playlist, &item);
@@ -662,19 +675,19 @@ int main(int argc, char **argv)
             DEBUG("mq_receive failed: %d", errno);
         }
         received = mq_receive(bg_mq, buf, attr.mq_msgsize, NULL);
-        if (received == sizeof(*message)) {
-            message = (struct tagMessage *) buf;
-            if (message->be_overwrite) {
+        if (received == sizeof(*play_req)) {
+            play_req = (struct sound_play_req_t *) buf;
+            if (play_req->be_overwrite) {
                 playlist_clear(&self.sinks[WORKER_BACKGROUND].playlist);
                 if (self.sinks[WORKER_BACKGROUND].playing) {
                     self.sinks[WORKER_BACKGROUND].playing->be_cancel = true;
                 }
             }
-            if (message->play_id == 0xFFFFFFFF) {
+            if (play_req->play_id == 0xFFFFFFFF) {
                 be_exit = true;
-            } else if (message->play_id > 0) {
-                item.play_id = message->play_id;
-                strncpy(item.source, message->source, sizeof(item.source));
+            } else if (play_req->play_id > 0) {
+                item.play_id = play_req->play_id;
+                strncpy(item.source, play_req->source, sizeof(item.source));
                 item.channels = 2;
                 item.be_cancel = false;
                 playlist_enq(&self.sinks[WORKER_BACKGROUND].playlist, &item);
@@ -682,8 +695,24 @@ int main(int argc, char **argv)
         } else if ((received == -1) && (errno != EAGAIN)) {
             DEBUG("mq_receive failed: %d", errno);
         }
+        received = mq_receive(vol_mq, buf, attr.mq_msgsize, NULL);
+        if (received == sizeof(*vol_req)) {
+            pa_cvolume volume;
+            pa_operation *ope;
+            vol_req = (struct sound_volume_req_t *) buf;
+            pa_cvolume_set(&volume, 2, (pa_volume_t) vol_req->volume);
+            ope = pa_context_set_sink_volume_by_index(self.context, 0, &volume, NULL, NULL);
+            if (!ope) {
+                DEBUG("pa_context_set_sink_volume_by_index failed: %d", pa_context_errno(self.context));
+            } else {
+                pa_operation_unref(ope);
+            }
+        } else if ((received == -1) && (errno != EAGAIN)) {
+            DEBUG("mq_receive failed: %d", errno);
+        }
         usleep(100000);
     }
+    mq_close(vol_mq);
     mq_close(bg_mq);
     mq_close(fg_mq);
 #endif
