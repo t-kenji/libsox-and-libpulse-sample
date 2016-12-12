@@ -19,15 +19,6 @@
 #include <sys/utsname.h>
 #include <unistd.h>
 
-typedef enum {RG_off, RG_track, RG_album, RG_default} rg_mode;
-static lsx_enum_item const rg_modes[] = {
-  LSX_ENUM_ITEM(RG_,off)
-  LSX_ENUM_ITEM(RG_,track)
-  LSX_ENUM_ITEM(RG_,album)
-  {0, 0}};
-
-/* Input & output files */
-
 typedef struct {
   char * filename;
 
@@ -36,12 +27,9 @@ typedef struct {
   sox_signalinfo_t signal;
   sox_encodinginfo_t encoding;
   double volume;
-  double replay_gain;
   sox_oob_t oob;
-  sox_bool no_glob;
 
   sox_format_t * ft;  /* libSoX file descriptor */
-  uint64_t volume_clips;
 } file_t;
 
 static file_t ifile_, *ifile = &ifile_;
@@ -60,20 +48,11 @@ static sox_effects_chain_t *effects_chain = NULL;
 
 static sox_signalinfo_t combiner_signal, ofile_signal_options;
 static sox_encodinginfo_t combiner_encoding, ofile_encoding_options;
-static uint64_t input_wide_samples = 0;
-static uint64_t read_wide_samples = 0;
-static uint64_t output_samples = 0;
-static sox_bool input_eof = sox_false;
-static sox_bool output_eof = sox_false;
 static sox_bool user_abort = sox_false;
-static sox_bool user_skip = sox_false;
-static sox_bool user_restart_eff = sox_false;
 static int success = 0;
 static int cleanup_called = 0;
 
 static sox_bool is_guarded;
-
-struct timeval load_timeofday;
 
 #define DEBUG(fmt,...) do{fprintf(stderr,"%s:%d " fmt "\n",__FILE__,__LINE__,##__VA_ARGS__);}while(0)
 
@@ -83,16 +62,15 @@ DEBUG("%s called", __func__);
   /* Close the input and output files before exiting. */
   if (ifile->ft) {
     sox_close(ifile->ft);
+    ifile->ft = NULL;
   }
   free(ifile->filename);
 
   if (ofile->ft) {
     sox_close(ofile->ft);
+    ofile->ft = NULL;
   }
   free(ofile->filename);
-
-  free(sox_globals.tmp_path);
-  sox_globals.tmp_path = NULL;
 
   sox_quit();
 
@@ -110,30 +88,6 @@ DEBUG("%s called", __func__);
     cleanup();
 }
 
-static void progress_to_next_input_file(file_t * f, sox_effect_t * effp)
-{
-  if (user_skip) {
-    user_skip = sox_false;
-    fprintf(stderr, "\nSkipped (Ctrl-C twice to quit).\n");
-  }
-DEBUG("%s called", __func__);
-  read_wide_samples = 0;
-  input_wide_samples = f->ft->signal.length / f->ft->signal.channels;
-  if (f->volume == HUGE_VAL) {
-    f->volume = 1;
-DEBUG("volume: %f", f->volume);
-  }
-  if (f->replay_gain != HUGE_VAL) {
-    f->volume *= pow(10.0, f->replay_gain / 20);
-DEBUG("volume: %f", f->volume);
-  }
-  if (effp && f->volume != floor(f->volume)) {
-    effp->out_signal.precision = SOX_SAMPLE_PRECISION;
-DEBUG("precision: %d", effp->out_signal.precision);
-  }
-  f->ft->sox_errno = errno = 0;
-}
-
 /* Read up to max `wide' samples.  A wide sample contains one sample per channel
  * from the input audio. */
 static size_t sox_read_wide(sox_format_t * ft, sox_sample_t * buf, size_t max)
@@ -145,18 +99,6 @@ DEBUG("%s called", __func__);
     lsx_fail("`%s' %s: %s",
         ft->filename, ft->sox_errstr, sox_strerror(ft->sox_errno));
   return len;
-}
-
-static void balance_input(sox_sample_t * buf, size_t ws, file_t * f)
-{
-  size_t s = ws * f->ft->signal.channels;
-
-DEBUG("%s called", __func__);
-  if (f->volume != 1) while (s--) {
-    double d = f->volume * *buf;
-DEBUG("%s d: %f", __func__, d);
-    *buf++ = SOX_ROUND_CLIP_COUNT(d, f->volume_clips);
-  }
 }
 
 /* The input combiner: contains one sample buffer per input file, but only
@@ -171,7 +113,7 @@ static int combiner_start(sox_effect_t *effp)
   input_combiner_t * z = (input_combiner_t *) effp->priv;
 
 DEBUG("%s called", __func__);
-  progress_to_next_input_file(ifile, effp);
+  ifile->ft->sox_errno = errno = 0;
   z->ilen = lsx_malloc(sizeof(*z->ilen));
   return SOX_SUCCESS;
 }
@@ -181,17 +123,9 @@ static int combiner_drain(sox_effect_t *effp, sox_sample_t * obuf, size_t * osam
   size_t olen = 0;
 
 DEBUG("%s called", __func__);
-  while (sox_true) {
-    if (!user_skip)
-      olen = sox_read_wide(ifile->ft, obuf, *osamp);
-    balance_input(obuf, olen, ifile);
-    break;
-  } /* while */
-  read_wide_samples += olen;
+  olen = sox_read_wide(ifile->ft, obuf, *osamp);
   olen *= effp->in_signal.channels;
   *osamp = olen;
-
-  input_eof = olen ? sox_false : sox_true;
 
   return olen? SOX_SUCCESS : SOX_EOF;
 }
@@ -218,11 +152,6 @@ DEBUG("%s called", __func__);
 
 static int ostart(sox_effect_t *effp)
 {
-  unsigned prec = effp->out_signal.precision;
-  if (effp->in_signal.mult && effp->in_signal.precision > prec) {
-    *effp->in_signal.mult *= 1 - (1 << (31 - prec)) * (1. / SOX_SAMPLE_MAX);
-DEBUG("%s mult: %f", __func__, *effp->in_signal.mult);
-  }
 DEBUG("%s called", __func__);
   return SOX_SUCCESS;
 }
@@ -232,12 +161,10 @@ static int output_flow(sox_effect_t *effp, sox_sample_t const * ibuf,
 {
   size_t len;
 
-DEBUG("%s called", __func__);
   (void)effp, (void)obuf;
   *osamp = 0;
   len = *isamp? sox_write(ofile->ft, ibuf, *isamp) : 0;
-  output_samples += len / ofile->ft->signal.channels;
-  output_eof = (len != *isamp) ? sox_true: sox_false;
+DEBUG("%s isamp: %lu, len: %lu", __func__, *isamp, len);
   if (len != *isamp) {
     if (ofile->ft->sox_errno)
       lsx_fail("`%s' %s: %s", ofile->ft->filename,
@@ -318,7 +245,7 @@ static void add_effects(sox_effects_chain_t *chain)
   sox_effect_t * effp;
   char * rate_arg = "-l";
 
-DEBUG("%s called", __func__);
+DEBUG("%s guard: %d", __func__, guard);
   /* 1st `effect' in the chain is the input combiner_signal.
    * add it only if its not there from a previous run.  */
   if (chain->length == 0) {
@@ -352,7 +279,7 @@ DEBUG("%s called", __func__);
 
 static int update_status(sox_bool all_done, void * client_data)
 {
-  return (user_abort || user_restart_eff) ? SOX_EOF : SOX_SUCCESS;
+  return user_abort ? SOX_EOF : SOX_SUCCESS;
 }
 
 static void open_output_file(void)
@@ -378,7 +305,6 @@ DEBUG("i: %d, start: %lu, length: %lu", i, oob.loops[i].start, oob.loops[i].leng
 DEBUG("filename: %s, filetype: %s", expand_fn, ofile->filetype);
   ofile->ft = sox_open_write(expand_fn, &ofile->signal, &ofile->encoding,
       ofile->filetype, &oob, NULL);
-  sox_delete_comments(&oob.comments);
   free(expand_fn);
 
   if (!ofile->ft)
@@ -523,14 +449,11 @@ static void init_file(file_t * f)
 DEBUG("%s called", __func__);
   memset(f, 0, sizeof(*f));
   sox_init_encodinginfo(&f->encoding);
-  f->volume = HUGE_VAL;
-  f->replay_gain = HUGE_VAL;
+  f->volume = 1.0f;
 }
 
 int main(int argc, char **argv)
 {
-  gettimeofday(&load_timeofday, NULL);
-
   if (sox_init() != SOX_SUCCESS)
     exit(1);
 
@@ -538,17 +461,12 @@ int main(int argc, char **argv)
 
   atexit(atexit_cleanup);
 
-{
-DEBUG("%s called", __func__);
-  file_t opts;
-  init_file(&opts);
-  *ifile = opts;
+  init_file(ifile);
   ifile->filename = lsx_strdup(argv[1]);
-  init_file(&opts);
-  opts.filetype = "pulseaudio";
-  *ofile = opts;
+  init_file(ofile);
+  ofile->filetype = "pulseaudio";
   ofile->filename = lsx_strdup("default");
-}
+
   signal(SIGINT, SIG_IGN); /* So child pipes aren't killed by track skip */
   ifile->ft = sox_open_read(ifile->filename, &ifile->signal, &ifile->encoding, ifile->filetype);
   if (!ifile->ft) {
