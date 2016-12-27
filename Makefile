@@ -1,6 +1,9 @@
 # makefile for aerosmith
 #
 
+### Cross compiler
+CC = ${CROSS_COMPILE}gcc ${DEF_FLAGS64}
+
 ### PulseAudio
 INCPULSE = -I ../pulseaudio/pulseaudio/src
 LIBPULSE = -L ../pulseaudio/pulseaudio/src/.libs -lpulse

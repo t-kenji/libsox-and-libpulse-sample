@@ -9,16 +9,21 @@
 #include <pthread.h>
 #include <semaphore.h>
 #include <mqueue.h>
+#include <sys/types.h>
 #include <sys/stat.h>
 
 #include <pulse/channelmap.h>
 #include <pulse/thread-mainloop.h>
 #include <pulse/introspect.h>
+#include <pulse/subscribe.h>
 #include <pulse/error.h>
 #include <sox.h>
 
 
 #define DEBUG(fmt,...) do{fprintf(stderr,"%s:%d " fmt "\n",__FILE__,__LINE__,##__VA_ARGS__);}while(0)
+
+#define UNUSED_VARIABLE(x) (void) (x)
+
 
 /** モノラル */
 #define CH_MONO (1)
@@ -88,6 +93,12 @@ struct tagAerosmith {
     struct tagSinkParam *standby;
     pthread_mutex_t play_mutex;
 };
+
+#include <sys/syscall.h>
+static inline pid_t gettid(void)
+{
+	return (pid_t) syscall(SYS_gettid);
+}
 
 static void playlist_init(struct tagPlaylist *playlist)
 {
@@ -187,62 +198,178 @@ static void print_sink_info(const pa_sink_input_info *info)
 static int update_status(sox_bool all_done, void * client_data)
 {
     struct tagPlayItem *item = client_data;
+	UNUSED_VARIABLE(all_done);
     return (item->be_cancel) ? SOX_EOF : SOX_SUCCESS;
+}
+
+static size_t sox_read_wide(sox_format_t *fmt, sox_sample_t *buf, size_t max_length)
+{
+	size_t read_length = sox_read(fmt, buf, max_length) / fmt->signal.channels;
+	if ((read_length == 0) && (fmt->sox_errno != 0)) {
+		DEBUG("`%s` %s: %s", fmt->filename, fmt->sox_errstr, sox_strerror(fmt->sox_errno));
+	}
+	return read_length;
+}
+
+static int input_drain(sox_effect_t *effp, sox_sample_t *obuf, size_t *osamp)
+{
+	sox_format_t **fmt = effp->priv;
+	size_t read_length = 0;
+
+	UNUSED_VARIABLE(effp);
+
+	read_length = sox_read_wide(*fmt, obuf, *osamp);
+	read_length *= effp->in_signal.channels;
+	*osamp = read_length;
+
+	return (read_length > 0) ? SOX_SUCCESS : SOX_EOF;
+}
+
+static sox_effect_handler_t const *get_input_effect_handler(void)
+{
+	static sox_effect_handler_t handler = {
+		"input",
+		NULL,
+		SOX_EFF_MCHAN,
+		NULL,
+		NULL,
+		NULL,
+		input_drain,
+		NULL,
+		NULL,
+		sizeof(sox_format_t *)
+	};
+	return &handler;
+}
+
+static int output_flow(sox_effect_t *effp, sox_sample_t const *ibuf, sox_sample_t *obuf, size_t *isamp, size_t *osamp)
+{
+	sox_format_t **fmt = effp->priv;
+	size_t output_length;
+
+	UNUSED_VARIABLE(effp);
+	UNUSED_VARIABLE(obuf);
+
+	*osamp = 0;
+	output_length = (*isamp > 0) ? sox_write(*fmt, ibuf, *isamp) : 0;
+	if (output_length != *isamp) {
+		if ((*fmt)->sox_errno) {
+			DEBUG("`%s` %s: %s", (*fmt)->filename, (*fmt)->sox_errstr, sox_strerror((*fmt)->sox_errno));
+		}
+		return SOX_EOF;
+	}
+	return SOX_SUCCESS;
+}
+
+static sox_effect_handler_t const *get_output_effect_handler(void)
+{
+	static sox_effect_handler_t handler = {
+		"output",
+		NULL,
+		SOX_EFF_MCHAN,
+		NULL,
+		NULL,
+		output_flow,
+		NULL,
+		NULL,
+		NULL,
+		sizeof(sox_format_t *)
+	};
+	return &handler;
 }
 
 static int play_sound(struct tagPlayItem *item)
 {
-    sox_format_t *sox_in, *sox_out;
-    sox_effects_chain_t * chain;
+	struct tagSoundFile {
+		char *path;
+		char const *type;
+		sox_signalinfo_t si;
+		sox_encodinginfo_t ei;
+		sox_oob_t oob;
+		sox_format_t *fmt;
+	} input, output;
+	sox_encodinginfo_t temp_enc;
+	sox_oob_t oob;
+    sox_effects_chain_t *chain;
+	sox_signalinfo_t interm_signal;
     sox_effect_t *effect;
-    sox_signalinfo_t interm_signal;
-    char *args[10];
+	uint64_t output_length;
 
-    sox_in = sox_open_read(item->source, NULL, NULL, NULL);
-    if (!sox_in) {
-        DEBUG("sox_open_read failed.");
+	/**
+	 * initialize input file.
+	 */
+	memset(&input, 0, sizeof(input));
+	sox_init_encodinginfo(&input.ei);
+	input.path = item->source;
+
+	/**
+	 * initialize output device.
+ 	 */
+	memset(&output, 0, sizeof(output));
+	sox_init_encodinginfo(&output.ei);
+	output.path = "default";
+	output.type = "pulseaudio";
+
+	signal(SIGINT, SIG_IGN);
+    input.fmt = sox_open_read(input.path, &input.si, &input.ei, input.type);
+    if (!input.fmt) {
+        DEBUG("sox_open_read failed: %d", errno);
         return -1;
     }
-    sox_out = sox_open_write("default", &sox_in->signal, NULL, "alsa", NULL, NULL);
-    if (!sox_out) {
-        DEBUG("sox_open_write failed.");
-        sox_close(sox_in);
+	signal(SIGINT, SIG_DFL);
+
+	temp_enc = output.ei;
+	if (!temp_enc.encoding) {
+		temp_enc.encoding = input.fmt->encoding.encoding;
+	}
+	if (!temp_enc.bits_per_sample) {
+		temp_enc.bits_per_sample = input.fmt->encoding.bits_per_sample;
+	}
+	if (sox_format_supports_encoding(output.path, output.type, &temp_enc)) {
+		output.ei= temp_enc;
+	}
+
+	output_length = input.fmt->signal.length / input.fmt->signal.channels;
+	if (!output.si.rate) {
+		output.si.rate = input.fmt->signal.rate;
+	}
+	if (!output.si.channels) {
+		output.si.channels = input.fmt->signal.channels;
+	}
+	output.si.length = (uint64_t) (output_length * output.si.channels * output.si.rate / input.fmt->signal.rate + .5);
+	
+	oob = input.fmt->oob;
+	output.fmt = sox_open_write(output.path, &output.si, &output.ei, output.type, &oob, NULL);
+    if (!output.fmt) {
+        DEBUG("sox_open_write failed: %d", errno);
+        sox_close(input.fmt);
         return -1;
     }
 
-    chain = sox_create_effects_chain(&sox_in->encoding, &sox_out->encoding);
+    chain = sox_create_effects_chain(&input.fmt->encoding, &output.fmt->encoding);
 
-    interm_signal = sox_in->signal;
+    interm_signal = input.fmt->signal;
 
-    effect = sox_create_effect(sox_find_effect("input"));
-    args[0] = (char *) sox_in, sox_effect_options(effect, 1, args);
-    sox_add_effect(chain, effect, &interm_signal, &sox_in->signal);
-    free(effect);
+	effect = sox_create_effect(get_input_effect_handler());
+	memcpy(effect->priv, &input.fmt, sizeof(input.fmt));
+	sox_add_effect(chain, effect, &interm_signal, &output.fmt->signal);
+	free(effect);
 
-    if (sox_in->signal.rate != sox_out->signal.rate) {
-        effect = sox_create_effect(sox_find_effect("rate"));
-        sox_effect_options(effect, 0, NULL);
-        sox_add_effect(chain, effect, &interm_signal, &sox_out->signal);
-        free(effect);
-    }
-
-    if (sox_in->signal.channels != sox_out->signal.channels) {
-        effect = sox_create_effect(sox_find_effect("channels"));
-        sox_effect_options(effect, 0, NULL);
-        sox_add_effect(chain, effect, &interm_signal, &sox_out->signal);
-        free(effect);
-    }
-
-    effect = sox_create_effect(sox_find_effect("output"));
-    args[0] = (char *) sox_out, sox_effect_options(effect, 1, args);
-    sox_add_effect(chain, effect, &interm_signal, &sox_out->signal);
-    free(effect);
+	effect = sox_create_effect(get_output_effect_handler());
+	memcpy(effect->priv, &output.fmt, sizeof(output.fmt));
+	if (sox_add_effect(chain, effect, &interm_signal, &output.fmt->signal) != SOX_SUCCESS) {
+		DEBUG("sox_add_effect failed.");
+		free(effect);
+		sox_close(output.fmt);
+		sox_close(input.fmt);
+	}
+	free(effect);
 
     sox_flow_effects(chain, update_status, item);
 
     sox_delete_effects_chain(chain);
-    sox_close(sox_out);
-    sox_close(sox_in);
+    sox_close(output.fmt);
+    sox_close(input.fmt);
 
     return 0;
 }
@@ -253,7 +380,8 @@ static void declarate_to_play_sound(struct tagSinkParam *param, struct tagPlayIt
     param->index = 0;
     param->parent->standby = param;
     param->playing = item;
-    param->dummy_device = 1; /* probe 用のデバイスが１つ作成されるためスキップする */
+    //param->dummy_device = 1; /* Ubuntu では probe 用のデバイスが１つ作成されるためスキップする */
+    param->dummy_device = 0;
 }
 
 static void end_sound_playback(struct tagSinkParam *param)
@@ -305,10 +433,9 @@ static void context_state_callback(pa_context *ctx, void *userdata)
     }
 }
 
+__attribute__((unused))
 static void context_get_sink_input_callback(pa_context *ctx, const pa_sink_input_info *info, int eol, void *userdata)
 {
-    void *state = NULL;
-
     if (eol < 0) {
         if (pa_context_errno(ctx) == PA_ERR_NOENTITY) {
             return;
@@ -326,7 +453,6 @@ static void context_get_sink_input_callback(pa_context *ctx, const pa_sink_input
 static void context_subscribe_callback(pa_context *ctx, pa_subscription_event_type_t type, uint32_t idx, void *userdata)
 {
     struct tagAerosmith *self = userdata;
-    pa_cvolume vol;
     pa_operation *ope;
     unsigned facility = type & PA_SUBSCRIPTION_EVENT_FACILITY_MASK;
 
@@ -373,6 +499,9 @@ static void context_subscribe_callback(pa_context *ctx, pa_subscription_event_ty
         case PA_SUBSCRIPTION_EVENT_REMOVE:
             DEBUG("remove index: %d", idx);
             break;
+		default:
+			DEBUG("event: %d, index: %d", type, idx);
+			break;
     }
 }
 
@@ -564,6 +693,12 @@ static void *bg_worker(void *userdata)
 
 int main(int argc, char **argv)
 {
+	enum {
+		ARGV_SELF,
+		ARGV_BG_SOUND,
+		ARGV_FG_SOUND,
+		ARGV_LENGTH
+	};
     static struct tagAerosmith self;
 
     if (initialize(&self) != 0) {
@@ -571,38 +706,24 @@ int main(int argc, char **argv)
     }
     
     /* foreground worker */
-    if (pthread_create(&self.sinks[0].thread_id, NULL, fg_worker, &self.sinks[0]) != 0) {
+    if (pthread_create(&self.sinks[WORKER_FOREGROUND].thread_id,
+			NULL, fg_worker, &self.sinks[WORKER_FOREGROUND]) != 0) {
         DEBUG("pthread_create failed.");
         terminate(&self);
         return 1;
     }
-    pthread_detach(self.sinks[0].thread_id);
+    pthread_detach(self.sinks[WORKER_FOREGROUND].thread_id);
 
     /* background worker */
-    if (pthread_create(&self.sinks[1].thread_id, NULL, bg_worker, &self.sinks[1]) != 0) {
+    if (pthread_create(&self.sinks[WORKER_BACKGROUND].thread_id,
+			NULL, bg_worker, &self.sinks[WORKER_BACKGROUND]) != 0) {
         DEBUG("pthread_create failed.");
         terminate(&self);
         return 2;
     }
-    pthread_detach(self.sinks[1].thread_id);
+    pthread_detach(self.sinks[WORKER_BACKGROUND].thread_id);
 
-#if 0
-    sleep(1);
-
-    {
-        struct tagPlayItem item;
-        uint32_t play_id = 0x100;
-        int i;
-
-        for (i = 0; i < 10; ++i) {
-            item.play_id = ++play_id;
-            strncpy(item.source, argv[2], sizeof(item.source));
-            item.channels = self.sample_spec.channels;
-            item.be_cancel = false;
-
-            playlist_enq(&self.sinks[1].playlist, &item);
-        }
-    }
+#if 1
     {
         struct tagPlayItem item;
         uint32_t play_id = 0;
@@ -610,14 +731,28 @@ int main(int argc, char **argv)
 
         for (i = 0; i < 10; ++i) {
             item.play_id = ++play_id;
-            strncpy(item.source, argv[1], sizeof(item.source));
+            strncpy(item.source, argv[ARGV_BG_SOUND], sizeof(item.source));
             item.channels = self.sample_spec.channels;
             item.be_cancel = false;
 
-            playlist_enq(&self.sinks[0].playlist, &item);
+            playlist_enq(&self.sinks[WORKER_BACKGROUND].playlist, &item);
         }
     }
+	if (argc >= ARGV_LENGTH) {
+   	     struct tagPlayItem item;
+   	     uint32_t play_id = 0x100;
+   	     int i;
 
+        for (i = 0; i < 10; ++i) {
+			sleep(5);
+            item.play_id = ++play_id;
+            strncpy(item.source, argv[ARGV_FG_SOUND], sizeof(item.source));
+            item.channels = self.sample_spec.channels;
+            item.be_cancel = false;
+
+            playlist_enq(&self.sinks[WORKER_FOREGROUND].playlist, &item);
+        }
+    }
     sleep(120);
 #else
     bool be_exit = false;
